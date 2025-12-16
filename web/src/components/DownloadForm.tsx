@@ -13,6 +13,7 @@ import {
   FileText,
   CheckCircle,
   XCircle,
+  Hash,
 } from 'lucide-react';
 import JSZip from 'jszip';
 
@@ -25,9 +26,10 @@ interface DownloadState {
 
 interface BulkDownloadItem {
   url: string;
-  status: 'pending' | 'downloading' | 'success' | 'error';
+  status: 'pending' | 'downloading' | 'success' | 'error' | 'skipped';
   error?: string;
   filename?: string;
+  fileNumber?: number;
 }
 
 type DownloadMode = 'single' | 'bulk';
@@ -37,6 +39,7 @@ export function DownloadForm() {
   const [url, setUrl] = useState('');
   const [bulkUrls, setBulkUrls] = useState('');
   const [folderName, setFolderName] = useState('instagram_downloads');
+  const [startNumber, setStartNumber] = useState(1);
   const [sessionId, setSessionId] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [state, setState] = useState<DownloadState>({
@@ -151,6 +154,7 @@ export function DownloadForm() {
     const folder = zip.folder(folderName.trim() || 'instagram_downloads');
     let successCount = 0;
     let errorCount = 0;
+    let currentFileNumber = startNumber;
 
     for (let i = 0; i < items.length; i++) {
       if (abortRef.current) break;
@@ -184,23 +188,29 @@ export function DownloadForm() {
 
         const blob = await mediaResponse.blob();
         const ext = media.type === 'video' ? 'mp4' : 'jpg';
-        const filename = `${i + 1}_${media.id}.${ext}`;
+        const filename = `${currentFileNumber}.${ext}`;
 
         folder?.file(filename, blob);
         successCount++;
 
         setBulkItems((prev) =>
-          prev.map((p, idx) => (idx === i ? { ...p, status: 'success', filename } : p))
+          prev.map((p, idx) =>
+            idx === i ? { ...p, status: 'success', filename, fileNumber: currentFileNumber } : p
+          )
         );
+
+        // Only increment file number on success
+        currentFileNumber++;
       } catch (error) {
         errorCount++;
         setBulkItems((prev) =>
           prev.map((p, idx) =>
             idx === i
-              ? { ...p, status: 'error', error: error instanceof Error ? error.message : 'Failed' }
+              ? { ...p, status: 'skipped', error: error instanceof Error ? error.message : 'Failed' }
               : p
           )
         );
+        // Don't increment file number on error - skip this number
       }
 
       // Small delay to avoid rate limiting
@@ -227,8 +237,8 @@ export function DownloadForm() {
 
     setState({
       loading: false,
-      error: errorCount > 0 ? `${errorCount} download(s) failed` : null,
-      success: successCount > 0 ? `Downloaded ${successCount} file(s)!` : null,
+      error: errorCount > 0 ? `${errorCount} download(s) skipped` : null,
+      success: successCount > 0 ? `Downloaded ${successCount} file(s)! (${startNumber}-${currentFileNumber - 1})` : null,
       downloading: false,
     });
   };
@@ -370,21 +380,41 @@ export function DownloadForm() {
       {mode === 'bulk' && (
         <form onSubmit={handleBulkSubmit} className="card mb-6">
           <div className="flex flex-col gap-4">
-            {/* Folder Name Input */}
-            <div>
-              <label className="block text-sm font-medium mb-2">
-                <FolderDown className="w-4 h-4 inline mr-2" />
-                Folder/ZIP Name
-              </label>
-              <input
-                type="text"
-                value={folderName}
-                onChange={(e) => setFolderName(e.target.value)}
-                placeholder="instagram_downloads"
-                className="input-field"
-                disabled={state.loading}
-              />
+            {/* Folder Name and Start Number */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  <FolderDown className="w-4 h-4 inline mr-2" />
+                  Folder/ZIP Name
+                </label>
+                <input
+                  type="text"
+                  value={folderName}
+                  onChange={(e) => setFolderName(e.target.value)}
+                  placeholder="instagram_downloads"
+                  className="input-field"
+                  disabled={state.loading}
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  <Hash className="w-4 h-4 inline mr-2" />
+                  Start Numbering At
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  value={startNumber}
+                  onChange={(e) => setStartNumber(Math.max(1, parseInt(e.target.value) || 1))}
+                  placeholder="1"
+                  className="input-field"
+                  disabled={state.loading}
+                />
+              </div>
             </div>
+            <p className="text-xs text-gray-500 -mt-2">
+              Files will be named: {startNumber}.mp4, {startNumber + 1}.mp4, {startNumber + 2}.mp4...
+            </p>
 
             {/* URLs Textarea */}
             <div>
@@ -472,13 +502,15 @@ export function DownloadForm() {
                   <Loader2 className="w-4 h-4 animate-spin text-primary" />
                 )}
                 {item.status === 'success' && <CheckCircle className="w-4 h-4 text-success" />}
-                {item.status === 'error' && <XCircle className="w-4 h-4 text-error" />}
+                {(item.status === 'error' || item.status === 'skipped') && (
+                  <XCircle className="w-4 h-4 text-warning" />
+                )}
                 <span className="flex-1 truncate font-mono text-xs">{item.url}</span>
                 {item.status === 'success' && item.filename && (
-                  <span className="text-xs text-success">{item.filename}</span>
+                  <span className="text-xs text-success font-medium">{item.filename}</span>
                 )}
-                {item.status === 'error' && item.error && (
-                  <span className="text-xs text-error">{item.error}</span>
+                {(item.status === 'error' || item.status === 'skipped') && item.error && (
+                  <span className="text-xs text-warning">Skipped: {item.error}</span>
                 )}
               </div>
             ))}
