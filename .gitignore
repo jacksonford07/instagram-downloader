@@ -1,0 +1,44 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Downloaded media (don't commit large files)
+downloads/
+*.mp4
+*.webm
+*.jpg
+*.jpeg
+*.png
+
+# Link files (may contain private data)
+links*.txt
+
+# Output directories
+allers*/
+emma*/
+isla*/
+penny*/
+sofia*/
+
+# Cookies (sensitive)
+cookies.txt
+*.cookies
+
+# CSV outputs
+*.csv
