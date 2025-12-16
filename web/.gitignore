@@ -47,3 +47,4 @@ next-env.d.ts
 downloads/
 *.mp4
 *.webm
+.env*.local

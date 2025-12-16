@@ -1,32 +1,42 @@
 'use client';
 
-import { useState } from 'react';
-import { Download, Loader2, AlertCircle, CheckCircle, Link, Copy, X } from 'lucide-react';
-
-interface MediaItem {
-  id: string;
-  type: 'video' | 'image' | 'carousel';
-  url: string;
-  thumbnailUrl?: string;
-  caption?: string;
-  username?: string;
-}
+import { useState, useEffect } from 'react';
+import { Download, Loader2, AlertCircle, Key, Link, Settings, X } from 'lucide-react';
 
 interface DownloadState {
   loading: boolean;
   error: string | null;
-  media: MediaItem[] | null;
-  copied: boolean;
+  success: string | null;
+  downloading: boolean;
 }
 
 export function DownloadForm() {
   const [url, setUrl] = useState('');
+  const [sessionId, setSessionId] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
   const [state, setState] = useState<DownloadState>({
     loading: false,
     error: null,
-    media: null,
-    copied: false,
+    success: null,
+    downloading: false,
   });
+
+  // Load session ID from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('instagram_session_id');
+    if (saved) {
+      setSessionId(saved);
+    }
+  }, []);
+
+  // Save session ID to localStorage
+  const saveSessionId = () => {
+    if (sessionId.trim()) {
+      localStorage.setItem('instagram_session_id', sessionId.trim());
+      setState((s) => ({ ...s, success: 'Session ID saved!', error: null }));
+      setTimeout(() => setState((s) => ({ ...s, success: null })), 2000);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,13 +46,17 @@ export function DownloadForm() {
       return;
     }
 
-    setState({ loading: true, error: null, media: null, copied: false });
+    setState({ loading: true, error: null, success: null, downloading: false });
 
     try {
+      // Pass session ID to API
       const response = await fetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim() }),
+        body: JSON.stringify({
+          url: url.trim(),
+          sessionId: sessionId.trim() || undefined
+        }),
       });
 
       const data = await response.json();
@@ -51,20 +65,39 @@ export function DownloadForm() {
         throw new Error(data.error ?? 'Failed to fetch media');
       }
 
-      setState({ loading: false, error: null, media: data.media, copied: false });
+      if (!data.media || data.media.length === 0) {
+        throw new Error('No media found');
+      }
+
+      // Auto-download the first media item
+      setState((s) => ({ ...s, downloading: true, success: 'Found media! Starting download...' }));
+
+      const media = data.media[0];
+      await downloadFile(media.url, media.id, media.type);
+
+      setState({
+        loading: false,
+        error: null,
+        success: 'Download complete!',
+        downloading: false
+      });
+
+      // Clear success message after 3 seconds
+      setTimeout(() => setState((s) => ({ ...s, success: null })), 3000);
+
     } catch (error) {
       setState({
         loading: false,
         error: error instanceof Error ? error.message : 'Something went wrong',
-        media: null,
-        copied: false,
+        success: null,
+        downloading: false,
       });
     }
   };
 
-  const handleDownload = async (media: MediaItem) => {
+  const downloadFile = async (mediaUrl: string, id: string, type: string) => {
     try {
-      const proxyUrl = `/api/download/proxy?url=${encodeURIComponent(media.url)}`;
+      const proxyUrl = `/api/download/proxy?url=${encodeURIComponent(mediaUrl)}`;
       const response = await fetch(proxyUrl);
 
       if (!response.ok) throw new Error('Download failed');
@@ -73,32 +106,70 @@ export function DownloadForm() {
       const downloadUrl = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = downloadUrl;
-      a.download = `instagram_${media.id}.${media.type === 'video' ? 'mp4' : 'jpg'}`;
+      a.download = `instagram_${id}.${type === 'video' ? 'mp4' : 'jpg'}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       window.URL.revokeObjectURL(downloadUrl);
-    } catch (error) {
-      setState((s) => ({
-        ...s,
-        error: error instanceof Error ? error.message : 'Download failed',
-      }));
+    } catch {
+      throw new Error('Failed to download file');
     }
-  };
-
-  const copyUrl = async (mediaUrl: string) => {
-    await navigator.clipboard.writeText(mediaUrl);
-    setState((s) => ({ ...s, copied: true }));
-    setTimeout(() => setState((s) => ({ ...s, copied: false })), 2000);
-  };
-
-  const clearResults = () => {
-    setState({ loading: false, error: null, media: null, copied: false });
-    setUrl('');
   };
 
   return (
     <div className="w-full max-w-2xl mx-auto">
+      {/* Settings Panel */}
+      <div className="card mb-6">
+        <button
+          type="button"
+          onClick={() => setShowSettings(!showSettings)}
+          className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300 hover:text-primary transition-colors w-full"
+        >
+          <Settings className="w-4 h-4" />
+          <span>{showSettings ? 'Hide' : 'Show'} Authentication Settings</span>
+          {sessionId && !showSettings && (
+            <span className="ml-auto text-xs text-success">Session ID configured</span>
+          )}
+        </button>
+
+        {showSettings && (
+          <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+            <label className="block text-sm font-medium mb-2">
+              Instagram Session ID
+            </label>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Key className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
+                <input
+                  type="password"
+                  value={sessionId}
+                  onChange={(e) => setSessionId(e.target.value)}
+                  placeholder="Paste your session ID here..."
+                  className="input-field pl-10 text-sm"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={saveSessionId}
+                className="px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors text-sm font-medium"
+              >
+                Save
+              </button>
+            </div>
+            <div className="mt-3 text-xs text-gray-500 space-y-1">
+              <p><strong>How to get your Session ID:</strong></p>
+              <ol className="list-decimal list-inside space-y-1 ml-2">
+                <li>Log into Instagram in Chrome</li>
+                <li>Press F12 to open DevTools</li>
+                <li>Go to Application → Cookies → instagram.com</li>
+                <li>Find &quot;sessionid&quot; and copy its value</li>
+              </ol>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Download Form */}
       <form onSubmit={handleSubmit} className="card mb-6">
         <div className="flex flex-col gap-4">
           <div className="relative">
@@ -109,34 +180,44 @@ export function DownloadForm() {
               onChange={(e) => setUrl(e.target.value)}
               placeholder="Paste Instagram URL here..."
               className="input-field pl-12"
-              disabled={state.loading}
+              disabled={state.loading || state.downloading}
             />
+            {url && (
+              <button
+                type="button"
+                onClick={() => setUrl('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            )}
           </div>
 
           <button
             type="submit"
-            disabled={state.loading || !url.trim()}
+            disabled={state.loading || state.downloading || !url.trim()}
             className="btn-primary flex items-center justify-center gap-2"
           >
-            {state.loading ? (
+            {state.loading || state.downloading ? (
               <>
                 <Loader2 className="w-5 h-5 animate-spin" />
-                Fetching...
+                {state.downloading ? 'Downloading...' : 'Fetching...'}
               </>
             ) : (
               <>
                 <Download className="w-5 h-5" />
-                Get Download Link
+                Download
               </>
             )}
           </button>
         </div>
 
         <p className="text-sm text-gray-500 mt-3 text-center">
-          Supports posts, reels, and stories
+          Paste a link and click Download - file saves directly to your device
         </p>
       </form>
 
+      {/* Error Message */}
       {state.error && (
         <div className="card mb-6 border-l-4 border-error bg-red-50 dark:bg-red-900/20">
           <div className="flex items-start gap-3">
@@ -144,89 +225,23 @@ export function DownloadForm() {
             <div>
               <p className="font-medium text-error">Error</p>
               <p className="text-sm text-gray-600 dark:text-gray-300">{state.error}</p>
+              {state.error.includes('authentication') && !sessionId && (
+                <p className="text-sm text-gray-500 mt-2">
+                  Try adding your Instagram Session ID above to access this content.
+                </p>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {state.media && state.media.length > 0 && (
-        <div className="card">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <CheckCircle className="w-5 h-5 text-success" />
-              <h3 className="font-semibold">
-                Found {state.media.length} {state.media.length === 1 ? 'item' : 'items'}
-              </h3>
-            </div>
-            <button
-              onClick={clearResults}
-              className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
-              title="Clear results"
-            >
-              <X className="w-5 h-5" />
-            </button>
+      {/* Success Message */}
+      {state.success && (
+        <div className="card mb-6 border-l-4 border-success bg-green-50 dark:bg-green-900/20">
+          <div className="flex items-center gap-3">
+            <Download className="w-5 h-5 text-success" />
+            <p className="text-success font-medium">{state.success}</p>
           </div>
-
-          <div className="space-y-4">
-            {state.media.map((media, index) => (
-              <div
-                key={media.id ?? index}
-                className="flex items-center gap-4 p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
-              >
-                <div className="flex-shrink-0">
-                  {media.thumbnailUrl ?? media.url ? (
-                    <div className="w-16 h-16 rounded-lg overflow-hidden bg-gray-200 dark:bg-gray-600">
-                      {media.type === 'video' ? (
-                        <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary to-secondary">
-                          <span className="text-white text-xs font-bold">VIDEO</span>
-                        </div>
-                      ) : (
-                        <img
-                          src={media.thumbnailUrl ?? media.url}
-                          alt="Preview"
-                          className="w-full h-full object-cover"
-                        />
-                      )}
-                    </div>
-                  ) : (
-                    <div className="w-16 h-16 rounded-lg bg-gray-200 dark:bg-gray-600" />
-                  )}
-                </div>
-
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium capitalize">{media.type}</p>
-                  {media.username && (
-                    <p className="text-sm text-gray-500">@{media.username}</p>
-                  )}
-                  {media.caption && (
-                    <p className="text-sm text-gray-500 truncate">{media.caption}</p>
-                  )}
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => copyUrl(media.url)}
-                    className="p-2 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg transition-colors"
-                    title="Copy URL"
-                  >
-                    <Copy className="w-5 h-5" />
-                  </button>
-                  <button
-                    onClick={() => handleDownload(media)}
-                    className="btn-primary py-2 px-4 text-sm"
-                  >
-                    Download
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {state.copied && (
-            <div className="mt-4 p-3 bg-success/10 text-success rounded-lg text-sm text-center">
-              URL copied to clipboard!
-            </div>
-          )}
         </div>
       )}
     </div>

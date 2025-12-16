@@ -47,7 +47,8 @@ export async function POST(request: NextRequest) {
     }
 
     const { url } = validation.data;
-    const sessionId = process.env['INSTAGRAM_SESSION_ID'];
+    // Use client-provided session ID or fall back to env var
+    const sessionId = body.sessionId || process.env['INSTAGRAM_SESSION_ID'];
 
     // Get media info
     const result = await getMediaInfo(url, sessionId);

@@ -61,6 +61,27 @@ function buildHeaders(sessionId?: string): HeadersInit {
     'Accept-Encoding': 'gzip, deflate',
     'X-IG-Capabilities': '3brTvw==',
     'X-IG-Connection-Type': 'WIFI',
+    'X-IG-App-ID': '936619743392459',
+  };
+
+  if (sessionId) {
+    headers['Cookie'] = `sessionid=${sessionId}; ds_user_id=${sessionId.split('%')[0]}`;
+  }
+
+  return headers;
+}
+
+function buildWebHeaders(sessionId?: string): HeadersInit {
+  const headers: HeadersInit = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
   };
 
   if (sessionId) {
@@ -68,36 +89,6 @@ function buildHeaders(sessionId?: string): HeadersInit {
   }
 
   return headers;
-}
-
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit,
-  retries = 3
-): Promise<Response> {
-  let lastError: Error | null = null;
-
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(url, options);
-      if (response.ok) return response;
-
-      if (response.status === 429) {
-        const waitTime = Math.pow(2, i) * 1000;
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
-        continue;
-      }
-
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      if (i < retries - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-  }
-
-  throw lastError ?? new Error('Failed after retries');
 }
 
 export async function getMediaInfo(
@@ -112,18 +103,42 @@ export async function getMediaInfo(
 
     const mediaType = extractMediaType(url);
 
-    // Try the embed endpoint first (no auth required for public posts)
-    const embedResult = await tryEmbedEndpoint(url);
-    if (embedResult.success) {
-      return embedResult;
-    }
+    // Try methods in order of reliability
 
-    // Fall back to API with session
+    // 1. Try GraphQL API with session (most reliable)
     if (sessionId) {
-      return await tryApiEndpoint(mediaId, mediaType, sessionId);
+      const graphqlResult = await tryGraphQLEndpoint(mediaId, sessionId);
+      if (graphqlResult.success) {
+        return graphqlResult;
+      }
     }
 
-    return { success: false, error: 'Could not fetch media. Try with authentication.' };
+    // 2. Try mobile API with session
+    if (sessionId) {
+      const apiResult = await tryApiEndpoint(mediaId, mediaType, sessionId);
+      if (apiResult.success) {
+        return apiResult;
+      }
+    }
+
+    // 3. Try scraping the page (works for some public posts)
+    const scrapeResult = await scrapeMediaPage(url, sessionId);
+    if (scrapeResult.success) {
+      return scrapeResult;
+    }
+
+    // 4. Try the ?__a=1&__d=dis endpoint
+    const jsonResult = await tryJsonEndpoint(url, sessionId);
+    if (jsonResult.success) {
+      return jsonResult;
+    }
+
+    return {
+      success: false,
+      error: sessionId
+        ? 'Could not fetch media. The post may be private or the session may have expired.'
+        : 'Could not fetch media. Try adding your Instagram Session ID for private content.'
+    };
   } catch (error) {
     return {
       success: false,
@@ -132,35 +147,127 @@ export async function getMediaInfo(
   }
 }
 
-async function tryEmbedEndpoint(url: string): Promise<DownloadResult> {
+async function tryGraphQLEndpoint(mediaId: string, sessionId: string): Promise<DownloadResult> {
   try {
-    // Use oembed endpoint
-    const oembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(url)}`;
-    const response = await fetch(oembedUrl, {
+    const variables = JSON.stringify({
+      shortcode: mediaId,
+      child_comment_count: 0,
+      fetch_comment_count: 0,
+      parent_comment_count: 0,
+      has_threaded_comments: false,
+    });
+
+    const url = `https://www.instagram.com/graphql/query/?query_hash=b3055c01b4b222b8a47dc12b090e4e64&variables=${encodeURIComponent(variables)}`;
+
+    const response = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)',
+        ...buildWebHeaders(sessionId),
+        'X-Requested-With': 'XMLHttpRequest',
       },
     });
 
     if (!response.ok) {
-      return { success: false, error: 'Embed endpoint failed' };
+      return { success: false, error: 'GraphQL request failed' };
     }
 
-    // The oembed doesn't give us direct video URLs, so we need to scrape
-    return await scrapeMediaPage(url);
+    const data = await response.json();
+    const shortcodeMedia = data?.data?.shortcode_media;
+
+    if (!shortcodeMedia) {
+      return { success: false, error: 'No media in GraphQL response' };
+    }
+
+    return parseGraphQLMedia(shortcodeMedia);
   } catch {
-    return { success: false, error: 'Embed endpoint failed' };
+    return { success: false, error: 'GraphQL endpoint failed' };
   }
 }
 
-async function scrapeMediaPage(url: string): Promise<DownloadResult> {
+function parseGraphQLMedia(media: Record<string, unknown>): DownloadResult {
+  const result: MediaInfo[] = [];
+  const isVideo = media['is_video'] as boolean;
+  const typename = media['__typename'] as string;
+
+  if (typename === 'GraphSidecar') {
+    // Carousel
+    const edges = (media['edge_sidecar_to_children'] as Record<string, unknown>)?.['edges'] as Array<Record<string, unknown>>;
+    if (edges) {
+      for (const edge of edges) {
+        const node = edge['node'] as Record<string, unknown>;
+        if (node['is_video']) {
+          result.push({
+            id: node['id'] as string,
+            type: 'video',
+            url: node['video_url'] as string,
+            thumbnailUrl: node['display_url'] as string,
+          });
+        } else {
+          result.push({
+            id: node['id'] as string,
+            type: 'image',
+            url: node['display_url'] as string,
+          });
+        }
+      }
+    }
+  } else if (isVideo) {
+    result.push({
+      id: media['id'] as string,
+      type: 'video',
+      url: media['video_url'] as string,
+      thumbnailUrl: media['display_url'] as string,
+      username: (media['owner'] as Record<string, unknown>)?.['username'] as string,
+    });
+  } else {
+    result.push({
+      id: media['id'] as string,
+      type: 'image',
+      url: media['display_url'] as string,
+      username: (media['owner'] as Record<string, unknown>)?.['username'] as string,
+    });
+  }
+
+  if (result.length > 0) {
+    return { success: true, media: result };
+  }
+
+  return { success: false, error: 'Could not parse media' };
+}
+
+async function tryJsonEndpoint(url: string, sessionId?: string): Promise<DownloadResult> {
+  try {
+    // Clean the URL and add JSON suffix
+    const cleanUrl = url.split('?')[0] ?? url;
+    const jsonUrl = cleanUrl.endsWith('/')
+      ? `${cleanUrl}?__a=1&__d=dis`
+      : `${cleanUrl}/?__a=1&__d=dis`;
+
+    const response = await fetch(jsonUrl, {
+      headers: buildWebHeaders(sessionId),
+    });
+
+    if (!response.ok) {
+      return { success: false, error: 'JSON endpoint failed' };
+    }
+
+    const data = await response.json();
+    const items = data?.items;
+
+    if (!items || items.length === 0) {
+      return { success: false, error: 'No items in JSON response' };
+    }
+
+    return parseApiMedia(items[0]);
+  } catch {
+    return { success: false, error: 'JSON endpoint failed' };
+  }
+}
+
+async function scrapeMediaPage(url: string, sessionId?: string): Promise<DownloadResult> {
   try {
     const response = await fetch(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
+      headers: buildWebHeaders(sessionId),
+      redirect: 'follow',
     });
 
     if (!response.ok) {
@@ -169,26 +276,75 @@ async function scrapeMediaPage(url: string): Promise<DownloadResult> {
 
     const html = await response.text();
 
-    // Look for video URL in the page
-    const videoMatch = html.match(/"video_url":"([^"]+)"/);
-    const imageMatch = html.match(/"display_url":"([^"]+)"/);
-
+    // Try multiple patterns to find video/image URLs
     const media: MediaInfo[] = [];
+    const mediaId = extractMediaId(url) ?? 'unknown';
 
+    // Pattern 1: video_url in JSON
+    const videoMatch = html.match(/"video_url":"([^"]+)"/);
     if (videoMatch?.[1]) {
-      const videoUrl = videoMatch[1].replace(/\\u0026/g, '&');
+      const videoUrl = videoMatch[1]
+        .replace(/\\u0026/g, '&')
+        .replace(/\\\//g, '/');
       media.push({
-        id: extractMediaId(url) ?? 'unknown',
+        id: mediaId,
         type: 'video',
         url: videoUrl,
-        displayUrl: imageMatch?.[1]?.replace(/\\u0026/g, '&'),
       });
-    } else if (imageMatch?.[1]) {
-      media.push({
-        id: extractMediaId(url) ?? 'unknown',
-        type: 'image',
-        url: imageMatch[1].replace(/\\u0026/g, '&'),
-      });
+    }
+
+    // Pattern 2: contentUrl in JSON-LD
+    if (media.length === 0) {
+      const contentUrlMatch = html.match(/"contentUrl":"([^"]+)"/);
+      if (contentUrlMatch?.[1]) {
+        const contentUrl = contentUrlMatch[1]
+          .replace(/\\u0026/g, '&')
+          .replace(/\\\//g, '/');
+        media.push({
+          id: mediaId,
+          type: 'video',
+          url: contentUrl,
+        });
+      }
+    }
+
+    // Pattern 3: og:video meta tag
+    if (media.length === 0) {
+      const ogVideoMatch = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"/);
+      if (ogVideoMatch?.[1]) {
+        media.push({
+          id: mediaId,
+          type: 'video',
+          url: ogVideoMatch[1].replace(/&amp;/g, '&'),
+        });
+      }
+    }
+
+    // Pattern 4: display_url for images
+    if (media.length === 0) {
+      const imageMatch = html.match(/"display_url":"([^"]+)"/);
+      if (imageMatch?.[1]) {
+        const imageUrl = imageMatch[1]
+          .replace(/\\u0026/g, '&')
+          .replace(/\\\//g, '/');
+        media.push({
+          id: mediaId,
+          type: 'image',
+          url: imageUrl,
+        });
+      }
+    }
+
+    // Pattern 5: og:image meta tag as fallback
+    if (media.length === 0) {
+      const ogImageMatch = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/);
+      if (ogImageMatch?.[1]) {
+        media.push({
+          id: mediaId,
+          type: 'image',
+          url: ogImageMatch[1].replace(/&amp;/g, '&'),
+        });
+      }
     }
 
     if (media.length > 0) {
@@ -209,68 +365,116 @@ async function tryApiEndpoint(
   try {
     const headers = buildHeaders(sessionId);
 
+    // First, we need to convert shortcode to media_id
+    // The shortcode is base64-like, we need the numeric ID
+    const numericId = shortcodeToMediaId(mediaId);
+
     // Try media info endpoint
-    const apiUrl = `${INSTAGRAM_API_URL}/media/${mediaId}/info/`;
-    const response = await fetchWithRetry(apiUrl, { headers });
+    const apiUrl = `${INSTAGRAM_API_URL}/media/${numericId}/info/`;
+    const response = await fetch(apiUrl, { headers });
 
-    const data = await response.json();
+    if (!response.ok) {
+      // Try with shortcode directly
+      const altUrl = `${INSTAGRAM_API_URL}/media/${mediaId}/info/`;
+      const altResponse = await fetch(altUrl, { headers });
 
-    if (!data.items || data.items.length === 0) {
-      return { success: false, error: 'No media items found' };
+      if (!altResponse.ok) {
+        return { success: false, error: 'API request failed' };
+      }
+
+      const altData = await altResponse.json();
+      return parseApiMedia(altData.items?.[0]);
     }
 
-    const media: MediaInfo[] = [];
-    const item = data.items[0];
+    const data = await response.json();
+    return parseApiMedia(data.items?.[0]);
+  } catch {
+    return { success: false, error: 'API request failed' };
+  }
+}
 
-    if (item.video_versions) {
-      // Video content
-      const bestVideo = item.video_versions[0];
-      media.push({
-        id: item.pk,
-        type: 'video',
-        url: bestVideo.url,
-        thumbnailUrl: item.image_versions2?.candidates?.[0]?.url,
-        width: bestVideo.width,
-        height: bestVideo.height,
-        caption: item.caption?.text,
-        username: item.user?.username,
-      });
-    } else if (item.carousel_media) {
-      // Carousel
-      for (const carouselItem of item.carousel_media) {
-        if (carouselItem.video_versions) {
+function shortcodeToMediaId(shortcode: string): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let mediaId = BigInt(0);
+
+  for (const char of shortcode) {
+    const index = alphabet.indexOf(char);
+    if (index === -1) continue;
+    mediaId = mediaId * BigInt(64) + BigInt(index);
+  }
+
+  return mediaId.toString();
+}
+
+function parseApiMedia(item: Record<string, unknown> | undefined): DownloadResult {
+  if (!item) {
+    return { success: false, error: 'No media items found' };
+  }
+
+  const media: MediaInfo[] = [];
+
+  const videoVersions = item['video_versions'] as Array<Record<string, unknown>> | undefined;
+  const carouselMedia = item['carousel_media'] as Array<Record<string, unknown>> | undefined;
+  const imageVersions = item['image_versions2'] as Record<string, unknown> | undefined;
+
+  if (videoVersions && videoVersions.length > 0 && videoVersions[0]) {
+    // Video content
+    const bestVideo = videoVersions[0];
+    const candidates = (imageVersions?.['candidates'] as Array<Record<string, unknown>>) ?? [];
+    media.push({
+      id: String(item['pk'] ?? 'unknown'),
+      type: 'video',
+      url: bestVideo['url'] as string,
+      thumbnailUrl: candidates[0]?.['url'] as string | undefined,
+      width: bestVideo['width'] as number | undefined,
+      height: bestVideo['height'] as number | undefined,
+      caption: (item['caption'] as Record<string, unknown>)?.['text'] as string | undefined,
+      username: (item['user'] as Record<string, unknown>)?.['username'] as string | undefined,
+    });
+  } else if (carouselMedia && carouselMedia.length > 0) {
+    // Carousel
+    for (const carouselItem of carouselMedia) {
+      const itemVideoVersions = carouselItem['video_versions'] as Array<Record<string, unknown>> | undefined;
+      const itemImageVersions = carouselItem['image_versions2'] as Record<string, unknown> | undefined;
+
+      if (itemVideoVersions && itemVideoVersions.length > 0 && itemVideoVersions[0]) {
+        const candidates = (itemImageVersions?.['candidates'] as Array<Record<string, unknown>>) ?? [];
+        media.push({
+          id: String(carouselItem['pk'] ?? 'unknown'),
+          type: 'video',
+          url: itemVideoVersions[0]['url'] as string,
+          thumbnailUrl: candidates[0]?.['url'] as string | undefined,
+        });
+      } else if (itemImageVersions) {
+        const candidates = (itemImageVersions['candidates'] as Array<Record<string, unknown>>) ?? [];
+        if (candidates[0]) {
           media.push({
-            id: carouselItem.pk,
-            type: 'video',
-            url: carouselItem.video_versions[0].url,
-            thumbnailUrl: carouselItem.image_versions2?.candidates?.[0]?.url,
-          });
-        } else {
-          media.push({
-            id: carouselItem.pk,
+            id: String(carouselItem['pk'] ?? 'unknown'),
             type: 'image',
-            url: carouselItem.image_versions2?.candidates?.[0]?.url,
+            url: candidates[0]['url'] as string,
           });
         }
       }
-    } else if (item.image_versions2) {
-      // Single image
+    }
+  } else if (imageVersions) {
+    // Single image
+    const candidates = (imageVersions['candidates'] as Array<Record<string, unknown>>) ?? [];
+    if (candidates[0]) {
       media.push({
-        id: item.pk,
+        id: String(item['pk'] ?? 'unknown'),
         type: 'image',
-        url: item.image_versions2.candidates[0].url,
-        caption: item.caption?.text,
-        username: item.user?.username,
+        url: candidates[0]['url'] as string,
+        caption: (item['caption'] as Record<string, unknown>)?.['text'] as string | undefined,
+        username: (item['user'] as Record<string, unknown>)?.['username'] as string | undefined,
       });
     }
-
-    return { success: true, media };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'API request failed',
-    };
   }
+
+  if (media.length > 0) {
+    return { success: true, media };
+  }
+
+  return { success: false, error: 'Could not parse media from API response' };
 }
 
 export async function downloadMedia(mediaUrl: string): Promise<Blob | null> {
