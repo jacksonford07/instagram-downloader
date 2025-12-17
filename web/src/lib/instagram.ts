@@ -91,6 +91,34 @@ function buildWebHeaders(sessionId?: string): HeadersInit {
   return headers;
 }
 
+// Exponential backoff retry utility
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 2,
+  baseDelay = 1000
+): Promise<T> {
+  let lastError: Error | unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+
+      // Don't retry on the last attempt
+      if (attempt === maxRetries) {
+        break;
+      }
+
+      // Exponential backoff: 1s, 2s, 4s
+      const delay = baseDelay * Math.pow(2, attempt);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastError;
+}
+
 export async function getMediaInfo(
   url: string,
   sessionId?: string
@@ -107,7 +135,7 @@ export async function getMediaInfo(
 
     // 1. Try GraphQL API with session (most reliable)
     if (sessionId) {
-      const graphqlResult = await tryGraphQLEndpoint(mediaId, sessionId);
+      const graphqlResult = await withRetry(() => tryGraphQLEndpoint(mediaId, sessionId));
       if (graphqlResult.success) {
         return graphqlResult;
       }
@@ -115,20 +143,20 @@ export async function getMediaInfo(
 
     // 2. Try mobile API with session
     if (sessionId) {
-      const apiResult = await tryApiEndpoint(mediaId, mediaType, sessionId);
+      const apiResult = await withRetry(() => tryApiEndpoint(mediaId, mediaType, sessionId));
       if (apiResult.success) {
         return apiResult;
       }
     }
 
     // 3. Try scraping the page (works for some public posts)
-    const scrapeResult = await scrapeMediaPage(url, sessionId);
+    const scrapeResult = await withRetry(() => scrapeMediaPage(url, sessionId));
     if (scrapeResult.success) {
       return scrapeResult;
     }
 
     // 4. Try the ?__a=1&__d=dis endpoint
-    const jsonResult = await tryJsonEndpoint(url, sessionId);
+    const jsonResult = await withRetry(() => tryJsonEndpoint(url, sessionId));
     if (jsonResult.success) {
       return jsonResult;
     }
